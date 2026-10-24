@@ -1,37 +1,62 @@
-# CMX — byte-exact image codec + `.cmx` file format (prototype 0.2)
+# CMX 0.3 — smart image files for a low-bandwidth messenger
 
-Lossless: the decoder returns the **identical bytes** you put in. Integer-only math, so every
-platform computes the same predictions. Every encode is verified by decoding before it is accepted.
+Two tiers, chosen per image (or forced):
 
-## Use
-    python3 cmx.py pack photo.jpg photo.cmx [profile]   # profile 1 = smallest (default), 0 = light
-    python3 cmx.py unpack photo.cmx photo.jpg
-    npm i && node cmx.mjs unpack photo.cmx out.jpg      # JS decoder (JS encoder: generic modes only)
-    python3 verify_vectors.py && node verify_vectors.mjs  # conformance vectors for any new port
-    python3 fuzz.py                                       # edge-case + corruption tests (needs scikit-image, Pillow)
+| tier | what you get | typical saving | decode result |
+|---|---|---|---|
+| **original** | lossless recompression (JPEG model, PNG model, generic) | 19–26 % | the *identical bytes* |
+| **compressed** | smart lossy (AVIF / WebP / JPEG+lossless model), auto-picked | 80–97 % on photos | the compressed image (clearly marked lossy) |
 
-## Format
+`auto` (default) keeps screenshots, graphics, text, tiny files and small photos **exact**, and compresses
+large photos. Nothing is ever lossy silently: mode 4 in the header, `cmx.py info`, and a notice on unpack.
+
+## Install / use
+    pip install pillow numpy                  # only needed for the compressed tier
+    gcc -O2 -o cmxc cmxc.c                    # optional native core, ~100x faster for JPEG (see below)
+    python cmx.py doctor                      # what this machine supports
+    python cmx.py pack  photo.jpg photo.cmx                  # auto
+    python cmx.py pack  photo.jpg photo.cmx --tier original  # byte-exact
+    python cmx.py pack  photo.jpg photo.cmx --tier compressed --ssim 0.92 --max-edge 1600
+    python cmx.py pack  photo.jpg photo.cmx --net slow       # fit in 150 KB (or --target-kb N)
+    python cmx.py pack  photo.jpg photo.cmx --cpu weak       # skip slow AVIF encoder (weak phones)
+    python cmx.py info  photo.cmx | python cmx.py unpack photo.cmx out.jpg
+Windows without a compiler: `pip install ziglang` then `python -m ziglang cc -O2 -o cmxc.exe cmxc.c`.
+The included `cmxc.exe` was cross-compiled on Linux and NOT run on Windows by the author; rebuild if in doubt.
+
+## What "smart" does (cmx_lossy.py)
+* auto-rotates from EXIF, then drops EXIF/GPS (privacy); keeps the colour profile
+* classifies photo vs graphic (colour variety); graphics / <60 KB / small photos stay exact
+* resizes to max 1600 px (never upscales); big JPEGs are decoded at reduced size for speed
+* per codec, binary-searches the lowest quality whose luma-SSIM (measured at the size sent) >= floor (0.92),
+  then keeps the smallest of JPEG(+.cmx lossless model on top) / WebP / AVIF; JPEG is baseline so it stacks
+* byte budget: steps the picture size down (1.0, .8, .65, .5, .4, .3, .22) until it fits
+* verify-after-encode, same as the exact tier; refuses a lossy result that is not smaller than exact
+
+Measured, real photos (phone-quality JPEG in, SSIM floor 0.92): astronaut 91 %, cat 80 %, coffee 82 %
+(avg 84 %) in 1–2 s each; 12 MP synthetic photo -> 98 % in 13 s. Exact tier on the same files: 19–22 %.
+The 12 MP image is a smooth upscale, so real camera photos will compress less than that figure.
+
+## File format
     file   = "CMX" 0x01 | blob                 (relay/transport may drop the 4-byte magic)
-    blob   = mode|profile<<4 (1 byte) | SHA-256(original)[0:4] | varint(len) | payload
-    mode 0 stored   payload = original bytes
-    mode 1 generic  payload = context-mixing stream (any file)
-    mode 2 png      payload = deflate params(3) | meta | filter types | pixel stream   (PNG rebuilt bit-exactly)
-    mode 3 jpeg     payload = varint hdrLen | varint hdrCmLen | hdr(CM) | varint tailLen | tail | coefficient stream
-    text form       {"cmx":1,"d":"<base85, JSON-safe alphabet, blob without magic>"}
-    unknown mode / bad checksum / truncation  ->  decoder raises; it never returns wrong data.
+    blob   = mode|profile<<4 | SHA-256(decoded bytes)[0:4] | varint(len) | payload
+    mode 0 stored | 1 generic | 2 png | 3 jpeg (lossless)            (see 0.2 notes in cmx.py)
+    mode 4 lossy   payload = kind | varint origW | varint origH | varint origBytes | fidelity x100 | codec | body
+                   kind 0: body = image file (jpeg/webp/avif)   kind 1: body = a complete mode-3 blob
+                   decode returns the image file; codec 0 jpeg, 1 webp, 2 avif
+    text form      {"cmx":1,"d":"<base85, JSON-safe, blob without magic>"}
+Checksum covers the decoded image bytes. The informational fields (origW/H, origBytes, fidelity) are not
+checksummed. Bad checksum / truncation -> decoder raises, never returns wrong data.
 
-## JPEG algorithm (mode 3)
-1. Parse headers; Huffman-decode all MCUs into quantized DCT coefficients (baseline, 8-bit, 1 or 3 components,
-   any sampling, restart intervals). Rebuild the scan and require it to equal the original, else fall back.
-2. Per block: code #nonzero ACs, then ACs in zigzag order (zero flag, magnitude, sign) with contexts from the
-   same coefficient in the above/left blocks, in-block neighbours and remaining count.
-3. DC: dequantize the block's ACs, run an exact fixed-point IDCT for its top rows / left columns, compare with the
-   neighbours' bottom rows / right columns (value + slope), and predict the DC that makes the edge continuous.
-   Only the residual is coded, with the disagreement of the two predictions as context.
-4. Binary decisions are mixed (2 mixer sets + APM) and arithmetic-coded. Decoder rebuilds the exact Huffman bits.
+## Platforms
+Python: everything. Native (cmxc): modes 0, 1, 3, 4 decode; JPEG encode (PNG, lossy encode stay in Python).
+JS (cmx.mjs, needs `npm i pako`): decode modes 0-4; encode generic only. AVIF/WebP bytes are displayed with the
+platform decoder (Android 12+, current browsers; WebP is the universal fallback — use --cpu weak on old devices).
+Conformance: `python verify_vectors.py && node verify_vectors.mjs && python verify_native.py` (14 vectors).
+Tests: `python test_smart.py`, `python fuzz.py`.
 
-## Known limits
-* Progressive / arithmetic-coded / 12-bit JPEG and zopfli-style PNGs fall back to generic (≈5%).
-* Speed: Python ≈ 25 kpx/s, Node ≈ 0.2 MP/s. Fine for chat-sized images, too slow for 12 MP originals.
-  Production plan: one C/Rust core (Android NDK, WASM, Python) validated against `vectors/`.
-* PNG re-deflate relies on the zlib deflate algorithm: JS must use `pako`, not Node's built-in zlib.
+## Limits
+* Compressed tier needs Pillow+numpy and an AVIF-capable Pillow (this was built on Pillow 12.1; `doctor` tells you).
+* PNG exact path runs only in pure Python (~4 KB/s of pixels) — large PNG screenshots in tier original are slow.
+* Progressive/arithmetic JPEG and zopfli PNG fall back to generic (~5 %).
+* SSIM is a proxy; look at results for your content. Lossless recompression of an already-compressed file
+  (zip etc.) gains nothing — tested.
