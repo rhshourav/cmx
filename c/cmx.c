@@ -553,12 +553,18 @@ static Buf jpeg_payload_decode(const u8 *pl, size_t pn) {
   bcat(&out, tail, tl);
   cm_free(m->cm); free(m); free_blocks(blocks); free(hdr); return out;
 }
+static Buf decode_blob(const u8 *b, size_t n);
 static Buf decode_blob(const u8 *b, size_t n) {
   if (n < 6) die("truncated"); int mode = b[0] & 15, profile = b[0] >> 4; u8 chk[4]; memcpy(chk, b + 1, 4);
   size_t p = 5; size_t len = (size_t)vget(b, n, &p); const u8 *pl = b + p; size_t pn = n - p; Buf out = {0};
   if (mode == 0) { bcat(&out, pl, pn); }
   else if (mode == 1 && profile == 1) { out.p = (u8 *)xcalloc(len + 1, 1); out.n = out.cap = len; cm_dec_bytes(pl, pn, len, out.p); }
   else if (mode == 3) out = jpeg_payload_decode(pl, pn);
+  else if (mode == 4) {                                   /* lossy tier: kind | w | h | bytes | fidelity | codec | body */
+    size_t q = 0; if (pn < 1) die("corrupt lossy payload"); int kind = pl[q++];
+    vget(pl, pn, &q); vget(pl, pn, &q); vget(pl, pn, &q); q += 2; if (q > pn) die("corrupt lossy payload");
+    if (kind == 0) bcat(&out, pl + q, pn - q); else if (kind == 1) out = decode_blob(pl + q, pn - q); else unsup("lossy kind");
+  }
   else unsup("mode/profile");
   u8 c2[4]; sha4(out.p, out.n, c2);
   if (out.n != len || memcmp(c2, chk, 4)) die("integrity check failed (corrupt or truncated file)");
