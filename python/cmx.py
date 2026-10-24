@@ -964,6 +964,17 @@ def _wrap(mode, orig, payload, profile=1):
     return bytes([mode | (profile << 4)]) + hashlib.sha256(orig).digest()[:4] + vput(len(orig)) + payload
 
 
+def _lossy_decode(pl):
+    """Mode 4 (lossy 'Compressed' tier): returns the compressed image file (jpeg/webp/avif bytes)."""
+    kind = pl[0]; q = 1
+    _, q = vget(pl, q); _, q = vget(pl, q); _, q = vget(pl, q)      # original width, height, byte size (informational)
+    q += 2                                                            # fidelity x100, codec id
+    body = pl[q:]
+    if kind == 0: return body
+    if kind == 1: return decode(body)                                 # lossy JPEG that was recompressed losslessly
+    raise ValueError('unknown lossy kind')
+
+
 def decode(blob):
     mode = blob[0] & 15; profile = blob[0] >> 4
     chk = blob[1:5]; n, p = vget(blob, 5); pl = blob[p:]
@@ -971,6 +982,7 @@ def decode(blob):
     elif mode == 1: out = cm_dec(pl, n, profile)
     elif mode == 2: out = _png_decode(pl, profile)
     elif mode == 3: out = _jpeg_decode(pl)
+    elif mode == 4: out = _lossy_decode(pl)
     else: raise ValueError('unknown mode')
     if len(out) != n or hashlib.sha256(out).digest()[:4] != chk:
         raise ValueError('integrity check failed')
@@ -1038,15 +1050,123 @@ def from_file(f):
     return decode(f[4:])
 
 
+def _native():
+    """Locate the compiled native core (cmxc / cmxc.exe) next to this script or on PATH."""
+    import os, shutil
+    if os.environ.get('CMX_NO_NATIVE'): return None
+    here = os.path.dirname(os.path.abspath(__file__))
+    for n in (('cmxc.exe', 'cmxc') if os.name == 'nt' else ('cmxc',)):
+        p = os.path.join(here, n)
+        if os.path.isfile(p): return p
+    return shutil.which('cmxc')
+
+
+def _sniff(b):
+    if b[:2] == b'\xff\xd8': return 'jpg'
+    if b[:4] == b'RIFF' and b[8:12] == b'WEBP': return 'webp'
+    if b[4:8] == b'ftyp' and b[8:12] in (b'avif', b'avis'): return 'avif'
+    if b[:8] == PNG_SIG: return 'png'
+    return 'bin'
+
+
+def _kb(n): return '%.1f KB' % (n / 1024) if n < 1048576 else '%.2f MB' % (n / 1048576)
+
+
+def _cli(argv=None):
+    import sys, argparse, subprocess
+    ap = argparse.ArgumentParser(prog='cmx.py', description='.cmx: exact + smart-compressed image files')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    p = sub.add_parser('pack', help='create a .cmx file')
+    p.add_argument('src'); p.add_argument('dst')
+    p.add_argument('--tier', choices=['auto', 'original', 'compressed'], default='auto',
+                   help='original = byte-exact; compressed = smart lossy; auto = decide per image (default)')
+    p.add_argument('--ssim', type=float, default=0.92, help='fidelity floor for the compressed tier (0-1, default 0.92)')
+    p.add_argument('--max-edge', type=int, default=1600, help='longest side in pixels for the compressed tier (default 1600)')
+    p.add_argument('--target-kb', type=int, help='byte budget: shrink the picture until it fits')
+    p.add_argument('--net', choices=['slow', 'normal'], help='slow = budget of 150 KB')
+    p.add_argument('--cpu', choices=['normal', 'weak'], default='normal', help='weak = skip slow encoders (AVIF)')
+    p.add_argument('--profile', type=int, choices=[0, 1], default=1, help='lossless model: 1 smallest, 0 light')
+    p.add_argument('-q', '--quiet', action='store_true')
+    u = sub.add_parser('unpack', help='restore the file (exact tier) or the compressed image (lossy tier)')
+    u.add_argument('src'); u.add_argument('dst')
+    i = sub.add_parser('info', help='show what a .cmx file contains'); i.add_argument('src')
+    sub.add_parser('doctor', help='show which features this install supports')
+    a = ap.parse_args(argv)
+
+    if a.cmd == 'doctor':
+        import cmx_lossy
+        for k, v in cmx_lossy.capabilities().items(): print('%-12s %s' % (k, v))
+        return 0
+    if a.cmd == 'info':
+        f = open(a.src, 'rb').read()
+        if f[:4] != CMX_MAGIC: print('not a .cmx file'); return 1
+        import cmx_lossy
+        d = cmx_lossy.describe(f[4:])
+        names = {0: 'stored', 1: 'generic', 2: 'PNG model', 3: 'JPEG model (lossless)', 4: 'compressed tier (LOSSY)'}
+        print('file size      :', _kb(len(f))); print('mode           :', names.get(d['mode'], d['mode']))
+        print('lossless       :', 'NO - approximate image' if d['lossy'] else 'yes - decodes to the exact original bytes')
+        print('decodes to     :', _kb(d['bytes_after_decode']))
+        if d['lossy']:
+            w, h = d['original_dims']
+            print('codec          :', d['codec'], '(+ lossless JPEG model)' if d['stacked'] else '')
+            print('fidelity       : SSIM %.2f at the size sent' % d['fidelity'])
+            print('original       : %dx%d, %s  ->  %.0f%% smaller' % (w, h, _kb(d['original_bytes']), 100 * (1 - len(f) / d['original_bytes'])))
+        return 0
+
+    src_path, dst_path = a.src, a.dst
+    src = open(src_path, 'rb').read()
+    if a.cmd == 'unpack':
+        nat = _native()
+        if nat and src[4:5] and (src[4] & 15) in (0, 1, 3, 4) and (src[4] >> 4) == 1:
+            rc = subprocess.call([nat, 'unpack', src_path, dst_path])
+            if rc == 0:
+                out = open(dst_path, 'rb').read(); lossy = (src[4] & 15) == 4
+            elif rc != 2: return rc
+            else: nat = None
+        if not nat or rc == 2:
+            out = from_file(src); lossy = (src[4] & 15) == 4
+            open(dst_path, 'wb').write(out); print(len(src), '->', len(out), 'bytes')
+        if lossy:
+            ext = _sniff(out)
+            print('NOTE: this is the COMPRESSED (lossy) image, not the original. Format: %s%s' % (
+                ext, '' if dst_path.lower().endswith('.' + ext) or (ext == 'jpg' and dst_path.lower().endswith('.jpeg')) else
+                '  (consider naming it .' + ext + ')'), file=sys.stderr)
+        return 0
+
+    # ---- pack
+    tier = a.tier; target = a.target_kb or (150 if a.net == 'slow' else None)
+    log = None if a.quiet else (lambda s: print(s, file=sys.stderr))
+    if tier != 'original':
+        import cmx_lossy
+        blob, rep = cmx_lossy.smart_pack(src, tier=tier, ssim=a.ssim, max_edge=a.max_edge, target_kb=target, cpu=a.cpu, log=log)
+        open(dst_path, 'wb').write(CMX_MAGIC + blob)
+        total = len(blob) + 4
+        if not a.quiet:
+            print('decision: %s' % ('; '.join(rep['reasons']) or '-'), file=sys.stderr)
+            if rep['lossy']:
+                print('LOSSY %s%s q%d, %dx%d, SSIM %.2f: %s -> %s (%.0f%% smaller)' % (
+                    rep['codec'], '+cmx' if rep['stacked'] else '', rep['quality'], rep['dims'][0], rep['dims'][1], rep['ssim'],
+                    _kb(len(src)), _kb(total), 100 * (1 - total / len(src))))
+            else:
+                print('EXACT: %s -> %s (%.0f%% smaller, byte-identical on unpack)' % (_kb(len(src)), _kb(total), 100 * (1 - total / len(src))))
+        return 0
+    nat = _native()
+    if nat and a.profile == 1:
+        rc = subprocess.call([nat, 'pack', src_path, dst_path])
+        if rc == 0: return 0
+        if rc != 2: return rc
+        print('native core cannot handle this file, using the (slow) Python path', file=sys.stderr)
+    elif src[:2] == b'\xff\xd8':
+        try:
+            h = _jpeg_hdr(src); mp = h['W'] * h['H'] / 1e6
+            print('note: %.1f MP JPEG, no native core found -> pure Python needs about %.0f min.\n'
+                  '      build it for ~100x speed:  gcc -O2 -o cmxc cmxc.c' % (mp, mp * 138 / 60), file=sys.stderr)
+        except Exception: pass
+    out = to_file(src, profile=a.profile); open(dst_path, 'wb').write(out)
+    print('EXACT: %s -> %s' % (_kb(len(src)), _kb(len(out))))
+    return 0
+
+
 if __name__ == '__main__':
     import sys
-    if len(sys.argv) in (4, 5) and sys.argv[1] in ('pack', 'unpack'):
-        src = open(sys.argv[2], 'rb').read()
-        if sys.argv[1] == 'pack':
-            out = to_file(src, profile=int(sys.argv[4]) if len(sys.argv) == 5 else 1)
-        else:
-            out = from_file(src)
-        open(sys.argv[3], 'wb').write(out)
-        print(len(src), '->', len(out), 'bytes')
-    else:
-        print('usage: python3 cmx.py pack <in> <out.cmx> [profile 0=light|1=max] | unpack <in.cmx> <out>')
+    sys.exit(_cli())
